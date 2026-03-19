@@ -9,6 +9,7 @@ from .max_budget_per_session_limiter import _PROXY_MaxBudgetPerSessionHandler
 from .max_iterations_limiter import _PROXY_MaxIterationsHandler
 from .parallel_request_limiter import _PROXY_MaxParallelRequestsHandler
 from .parallel_request_limiter_v3 import _PROXY_MaxParallelRequestsHandler_v3
+from .max_available_capacity_limiter import _PROXY_MaxAvailableCapacityLimiter
 from .responses_id_security import ResponsesIDSecurity
 
 ### CHECK IF ENTERPRISE HOOKS ARE AVAILABLE ####
@@ -22,6 +23,7 @@ except ImportError:
 PROXY_HOOKS = {
     "max_budget_limiter": _PROXY_MaxBudgetLimiter,
     "parallel_request_limiter": _PROXY_MaxParallelRequestsHandler_v3,
+    "max_available_capacity_limiter": _PROXY_MaxAvailableCapacityLimiter,
     "cache_control_check": _PROXY_CacheControlCheck,
     "responses_id_security": ResponsesIDSecurity,
     "litellm_skills": SkillsInjectionHook,
@@ -43,6 +45,7 @@ def get_proxy_hook(
     hook_name: Union[
         Literal[
             "max_budget_limiter",
+            "max_available_capacity_limiter",
             "managed_files",
             "parallel_request_limiter",
             "cache_control_check",
