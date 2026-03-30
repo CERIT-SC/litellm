@@ -113,8 +113,8 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         from litellm.proxy.proxy_server import prisma_client
         if prisma_client is None:
             return -1
-        
-        sql_querry = """SELECT SUM(total_tokens) FROM "LiteLLM_SpendLogs" sl WHERE sl."endTime" >= NOW() - INTERVAL '5 minutes' AND model = $1;"""
+
+        sql_querry = """SELECT COALESCE(SUM(total_tokens)) FROM "LiteLLM_SpendLogs" sl WHERE sl."endTime" >= NOW() - INTERVAL '5 minutes' AND model = $1;"""
         db_response = await prisma_client.db.query_raw(sql_querry, model)
         if db_response is None:
             return -1
