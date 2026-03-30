@@ -1,8 +1,4 @@
 import datetime
-from time import timezone
-
-
-
 from litellm import Router
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.caching import DualCache
@@ -83,11 +79,9 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
             Deployment object containing litellm_params with tpm/rpm limits,
             or None if not found.
         """
-        verbose_proxy_logger.warning("INSIDE DEPLOYMENT BY MODEL NAME")
+
         if self.llm_router is None:
-            verbose_proxy_logger.warning(
-                "llm_router is not initialized. Call update_variables() first."
-            )
+
             return None
 
         return self.llm_router.get_deployment_by_model_group_name(
@@ -95,9 +89,7 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         )
 
     def calculate_load(self, curr_tokens_in_use: int, max_tokens: int) -> float:
-        if max_tokens == 0:
-            return 0.0
-        return min(curr_tokens_in_use / max_tokens, 1.0)
+        return 0 if max_tokens == 0 else min(curr_tokens_in_use / max_tokens, 1.0)
 
     def calculate_load_ema(self, curr_tokens_in_use: int, max_tokens: int) -> float:
 
@@ -120,39 +112,25 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
     async def get_generated_toknes_by_model_and_time(self, model: str):
         from litellm.proxy.proxy_server import prisma_client
         if prisma_client is None:
-            return []
+            return -1
         
         sql_querry = """SELECT SUM(total_tokens) FROM "LiteLLM_SpendLogs" sl WHERE sl."endTime" >= NOW() - INTERVAL '5 minutes' AND model = $1;"""
         db_response = await prisma_client.db.query_raw(sql_querry, model)
         if db_response is None:
-            return []
+            return -1
 
-        return db_response
+        return db_response[0]["sum"]
 
     async def get_model_workload(self, model) -> float:
-        from litellm.proxy.proxy_server import prisma_client
-        
-        
         tokens_used = await self.get_generated_toknes_by_model_and_time(model)
-        verbose_proxy_logger.debug(f"tokens used: {tokens_used}" )
-
+        verbose_proxy_logger.debug(f"tokens used: {tokens_used}")
         deployment = self.get_deployment_by_model_name(model)
         tpm_limit = 0
-        if deployment is not None:
-            if deployment.litellm_params.tpm is None:
-                tpm_limit = 0
-            else:
-                tpm_limit = deployment.litellm_params.tpm
 
+        if deployment is not None and deployment.litellm_params.tpm is not None:
+            tpm_limit = deployment.litellm_params.tpm
 
-            verbose_proxy_logger.debug(
-                f"Model {model}: TPM limit={tpm_limit}"
-            )
-        else:
-            verbose_proxy_logger.warning(f"No deployment found for model: {model}")
-
-
-        return self.calculate_load(100, tpm_limit)
+        return self.calculate_load(100 , tpm_limit)
 
     async def async_post_call_success_hook(
         self, data: dict, user_api_key_dict: UserAPIKeyAuth, response
