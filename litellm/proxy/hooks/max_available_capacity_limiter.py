@@ -64,7 +64,7 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
             return {"tokens_left": -1}
 
         cache_key = f"{api_key}:{model}"
-        cached_data = await cache.async_get_cache(cache_key)
+        cached_data = await cache.async_get_cache(cache_key) # dict keys model_name, tokens_left, timestamp
 
         if cached_data is None:
             return await self._create_user_budget(cache, cache_key, model)
