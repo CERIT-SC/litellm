@@ -8,10 +8,9 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.router import Deployment
 
 
-DEFAULT_TOKEN_BUDGET = 100
-DEFAULT_REFILL_RATE = 10  # tokens per second
-LOAD_EMA_ALPHA = 0.25
-WORKLOAD_WINDOW_MINUTES = 5
+DEFAULT_REQUEST_BUDGET = 10
+DEFAULT_REFILL_RATE = 1  # request per second
+WORKLOAD_WINDOW_MINUTES = 5 #WORKLOAD IN PAST X MINUTES
 
 
 class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
@@ -61,10 +60,10 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
     ) -> dict:
         """Get existing budget from cache or create new one."""
         if api_key is None:
-            return {"tokens_left": -1}
+            return {"requests_left": -1}
 
         cache_key = f"{api_key}:{model}"
-        cached_data = await cache.async_get_cache(cache_key) # dict keys model_name, tokens_left, timestamp
+        cached_data = await cache.async_get_cache(cache_key) # dict keys model_name, requests_left, timestamp
 
         if cached_data is None:
             return await self._create_user_budget(cache, cache_key, model)
@@ -80,7 +79,7 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         """Initialize a new user budget entry in cache."""
         budget_data = {
             "model": model,
-            "tokens_left": DEFAULT_TOKEN_BUDGET,
+            "requests_left": DEFAULT_REQUEST_BUDGET,
             "timestamp": datetime.datetime.now(datetime.timezone.utc),
         }
         await cache.async_set_cache(cache_key, budget_data)
@@ -102,12 +101,12 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
 
         elapsed_seconds = (now - timestamp).total_seconds()
         refill_rate = self._calculate_refill_rate(workload)
-        tokens_to_add = int(elapsed_seconds * refill_rate)
+        requests_to_add = int(elapsed_seconds * refill_rate)
 
-        current_tokens = cached_data.get("tokens_left", 0)
+        current_requests = cached_data.get("requests_left", 0)
         updated_data = {
             "model": cached_data.get("model"),
-            "tokens_left": current_tokens + tokens_to_add,
+            "requests_left": current_requests + requests_to_add,
             "timestamp": now,
         }
 
@@ -201,12 +200,3 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         if max_tokens == 0:
             return 0.0
         return min(tokens_used / max_tokens, 1.0)
-
-    def _calculate_load_ema(self, tokens_used: int, max_tokens: int) -> float:
-        """Calculate exponentially weighted moving average load."""
-        instant_load = self._calculate_load(tokens_used, max_tokens)
-
-        smooth_load = LOAD_EMA_ALPHA * instant_load + (1 - LOAD_EMA_ALPHA) * self._prev_load
-        self._prev_load = smooth_load
-
-        return round(smooth_load, 3)
