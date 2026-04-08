@@ -1,5 +1,6 @@
 import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+from fastapi import  HTTPException
 
 from litellm._logging import verbose_proxy_logger
 from litellm.caching.caching import DualCache
@@ -8,7 +9,15 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.router import Deployment
 
 
-DEFAULT_REQUEST_BUDGET = 10
+if TYPE_CHECKING:
+    from litellm.proxy.utils import InternalUsageCache as _InternalUsageCache
+
+    InternalUsageCache = _InternalUsageCache
+else:
+    InternalUsageCache = object
+
+
+DEFAULT_REQUEST_BUDGET = 5
 DEFAULT_REFILL_RATE = 1  # request per second
 WORKLOAD_WINDOW_MINUTES = 5 #WORKLOAD IN PAST X MINUTES
 
@@ -71,19 +80,10 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         model = response_obj["model"]
         user_api_key_dict: UserAPIKeyAuth = kwargs.get("litellm_params", {}).get("metadata", {}).get("user_api_key_auth", {})
         api_key = user_api_key_dict.api_key
-        cache = self.internal_usage_cache.dual_cache
-
-        await self.handle_succss_event(api_key, model, cache)
-
-
-    async def handle_succss_event(self, api_key: Optional[str], model: str, cache: DualCache) -> None:
-        verbose_proxy_logger.debug("Inside handle_succss_event")
         cache_key = f"{api_key}:{model}"
-
-        user_data = await cache.async_get_cache(cache_key)
-        user_data["requests_left"] -= 1
+        user_data = await self.cache.async_get_cache(cache_key)
         verbose_proxy_logger.debug(f"user data after change: {user_data}")
-        await cache.async_set_cache(cache_key, user_data)
+        await self.handle_succss_event(api_key, model)
 
 
 
@@ -94,7 +94,6 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
 
     async def _get_or_create_user_budget(
         self,
-        cache: DualCache,
         api_key: Optional[str],
         model: str,
         workload: float,
@@ -104,12 +103,12 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
             return {"requests_left": -1}
 
         cache_key = f"{api_key}:{model}"
-        cached_data = await cache.async_get_cache(cache_key) # dict keys model_name, requests_left, timestamp
+        cached_data = await self.cache.async_get_cache(cache_key) # dict keys model_name, requests_left, timestamp
 
         if cached_data is None:
-            return await self._create_user_budget(cache, cache_key, model)
+            return await self._create_user_budget(self.cache, cache_key, model)
 
-        return await self._refill_user_budget(cache, cache_key, cached_data, workload)
+        return await self._refill_user_budget(self.cache, cache_key, cached_data, workload)
 
     async def _create_user_budget(
         self,
@@ -142,7 +141,7 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
 
         elapsed_seconds = (now - timestamp).total_seconds()
         refill_rate = self._calculate_refill_rate(workload)
-        requests_to_add = int(elapsed_seconds * refill_rate)
+        requests_to_add = int(elapsed_seconds * refill_rate) * 0 #TODO FOR TESTING ONLY
 
         current_requests = cached_data.get("requests_left", 0)
         updated_data = {
@@ -156,33 +155,30 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
 
     # ==================== Refill Rate Calculation ====================
 
-    def _calculate_refill_rate(self, workload: float, base_rate: float = DEFAULT_REFILL_RATE) -> float:
+    def _calculate_refill_rate(self, workload: float, base_rate: float = 0.1) -> float: # TODO check saturation in dynamic_rate_limiter_v3.py
         """
-        Calculate token refill rate based on system workload.
-
-        Zones:
-        - Green (workload < 0.5): 120% of base rate
-        - Yellow (0.5 <= workload < 0.8): Linear decrease from 100% to 40%
-        - Red (workload >= 0.8): Exponential decrease from 40% to 2%
+        Calculate REQUEST refill rate based on system workload.
 
         Args:
             workload: System load ratio (0.0 to 1.0)
-            base_rate: Base refill rate in tokens per second
+            base_rate: Base refill rate in REQUESTS per second (default 0.1 = 6 req/min)
 
         Returns:
-            Effective refill rate in tokens per second
+            Effective refill rate in requests per second
         """
         if workload < 0.5:
-            # Green zone: bonus for low load
+            # Green zone: 20% bonus (0.12 req/s = 7.2 req/min)
             return base_rate * 1.2
 
         if workload < 0.8:
-            # Yellow zone: linear decrease
-            factor = 1.0 - (workload - 0.5) * 2
+            # Yellow zone: linear decrease 100% -> 40%
+            # 0.5 -> 0.1 req/s, 0.8 -> 0.04 req/s
+            factor = 1.0 - (workload - 0.5) * 2  # 2 = 1/(0.8-0.5)
             return base_rate * max(factor, 0.4)
 
-        # Red zone: exponential decrease
-        factor = 0.4 * ((1 - workload) / 0.2) ** 2
+        # Red zone: exponential decrease 40% -> 2%
+        # 0.8 -> 0.04 req/s, 0.9 -> 0.01 req/s, 1.0 -> 0.002 req/s
+        factor = 0.4 * ((1.0 - workload) / 0.2) ** 2
         return base_rate * max(factor, 0.02)
 
     # ==================== Workload Calculation ====================
