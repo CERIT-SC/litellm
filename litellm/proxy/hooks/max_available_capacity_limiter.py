@@ -17,6 +17,13 @@ else:
     InternalUsageCache = object
 
 
+from typing import TypedDict
+
+class CacheData(TypedDict):
+    model_name: str
+    requests_left: int
+    last_refill: datetime.datetime
+
 DEFAULT_REQUEST_BUDGET = 5
 DEFAULT_REFILL_RATE = 1  # request per second
 WORKLOAD_WINDOW_MINUTES = 5 #WORKLOAD IN PAST X MINUTES
