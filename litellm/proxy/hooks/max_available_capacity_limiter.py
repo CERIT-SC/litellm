@@ -21,7 +21,8 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
     Lower workload = faster refill, higher workload = slower refill.
     """
 
-    def __init__(self):
+    def __init__(self, internal_usage_cache: InternalUsageCache):
+        self.cache  = internal_usage_cache.dual_cache
         self._prev_load: float = 0.0
 
     # ==================== Hooks ====================
