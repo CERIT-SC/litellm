@@ -37,7 +37,20 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         api_key = user_api_key_dict.api_key
 
         workload = await self._get_model_workload(model)
-        await self._get_or_create_user_budget(cache, api_key, model, workload)
+        data = await self._get_or_create_user_budget(api_key, model, workload)
+
+        if data["requests_left"] <= 0:
+            raise HTTPException(status_code=429, detail={"error": "Model capacity reached for {model}. Priority: {priority}, ..."})
+
+        requests_left = data.get("requests_left") or 0
+        updated_data = {
+            "model": data.get("model"),
+            "requests_left": requests_left - 1,
+            "timestamp": data.get("timestamp"),
+        }
+
+        cache_key = f"{api_key}:{model}"
+        await self.cache.async_set_cache(cache_key, updated_data)
 
     async def async_post_call_success_hook(
         self,
