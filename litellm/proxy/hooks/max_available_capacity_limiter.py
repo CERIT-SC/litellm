@@ -49,6 +49,33 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         verbose_proxy_logger.debug(f"data: {data}")
         verbose_proxy_logger.debug(f"response: {response}")
 
+    async def async_log_success_event(
+        self, kwargs, response_obj, start_time, end_time
+    ) -> None:
+        verbose_proxy_logger.debug("Inside log success event")
+
+        model = response_obj["model"]
+        user_api_key_dict: UserAPIKeyAuth = kwargs.get("litellm_params", {}).get("metadata", {}).get("user_api_key_auth", {})
+        api_key = user_api_key_dict.api_key
+        cache = self.internal_usage_cache.dual_cache
+
+        await self.handle_succss_event(api_key, model, cache)
+
+
+    async def handle_succss_event(self, api_key: Optional[str], model: str, cache: DualCache) -> None:
+        verbose_proxy_logger.debug("Inside handle_succss_event")
+        cache_key = f"{api_key}:{model}"
+
+        user_data = await cache.async_get_cache(cache_key)
+        user_data["requests_left"] -= 1
+        verbose_proxy_logger.debug(f"user data after change: {user_data}")
+        await cache.async_set_cache(cache_key, user_data)
+
+
+
+
+
+
     # ==================== Budget Management ====================
 
     async def _get_or_create_user_budget(
