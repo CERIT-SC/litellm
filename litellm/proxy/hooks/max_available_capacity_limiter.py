@@ -53,8 +53,17 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         model = data["model"]
         api_key = user_api_key_dict.api_key
 
-        workload = await self._get_model_workload(model)
-        data = await self._get_or_create_user_budget(api_key, model, workload)
+        verbose_proxy_logger.debug("MaxAvailableCapacityLimiter: pre call hook 1")
+
+        try:
+            workload = await self._get_model_workload(model)
+            user_data = await self._get_user_budget(api_key, model, workload)
+        except HTTPException:
+            raise
+        except Exception as e:
+
+            verbose_proxy_logger.error(f"Error in max available capacity rate limiter: {e}, allowing request")
+            return None  # request allowed
 
         if data["requests_left"] <= 0:
             raise HTTPException(status_code=429, detail={"error": "Model capacity reached for {model}. Priority: {priority}, ..."})
