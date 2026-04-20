@@ -19,13 +19,18 @@ else:
 
 from typing import TypedDict
 
-class CacheData(TypedDict):
+class CacheDataUser(TypedDict):
     model_name: str
     requests_left: int
-    last_refill: datetime.datetime
+    last_refill: str  # ISO format string for JSON serialization
+
+class CacheDataModel(TypedDict):
+    workload: float
+    tokens_used: int
+    timestamp: str
 
 DEFAULT_REQUEST_BUDGET = 5
-DEFAULT_REFILL_RATE = 1  # request per second
+DEFAULT_REFILL_RATE = 10  # request per second
 WORKLOAD_WINDOW_MINUTES = 5 #WORKLOAD IN PAST X MINUTES
 
 
@@ -53,7 +58,7 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         model = data["model"]
         api_key = user_api_key_dict.api_key
 
-        verbose_proxy_logger.debug("MaxAvailableCapacityLimiter: pre call hook 1")
+        verbose_proxy_logger.debug(f"MaxAvailableCapacityLimiter: pre call hook {datetime.datetime.now(datetime.timezone.utc).isoformat(sep=' ')}")
 
         try:
             workload = await self._get_model_workload(model)
@@ -65,18 +70,20 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
             verbose_proxy_logger.error(f"Error in max available capacity rate limiter: {e}, allowing request")
             return None  # request allowed
 
-        if data["requests_left"] <= 0:
+
+
+        if user_data["requests_left"] <= 0:
             raise HTTPException(status_code=429, detail={"error": "Model capacity reached for {model}. Priority: {priority}, ..."})
 
-        requests_left = data.get("requests_left") or 0
-        updated_data = {
-            "model": data.get("model"),
-            "requests_left": requests_left - 1,
-            "timestamp": data.get("timestamp"),
+        updated_data: CacheDataUser = {
+            "model_name": user_data["model_name"],
+            "requests_left": user_data["requests_left"] - 1,
+            "last_refill": user_data["last_refill"],
         }
 
         cache_key = f"{api_key}:{model}"
         await self.cache.async_set_cache(cache_key, updated_data)
+        return None
 
     async def async_post_call_success_hook(
         self,
@@ -97,10 +104,16 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         user_api_key_dict: UserAPIKeyAuth = kwargs.get("litellm_params", {}).get("metadata", {}).get("user_api_key_auth", {})
         api_key = user_api_key_dict.api_key
         cache_key = f"{api_key}:{model}"
-        user_data = await self.cache.async_get_cache(cache_key)
-        verbose_proxy_logger.debug(f"user data after change: {user_data}")
-        await self.handle_succss_event(api_key, model)
 
+        total_tokens = response_obj.get("usage").get("total_tokens", 0)
+
+        model_data: CacheDataModel = await self.cache.async_get_cache(model)
+
+        await self.cache.async_set_cache(model, {
+            "workload": model_data["workload"],
+            "tokens_used": model_data["tokens_used"] + total_tokens,
+            "timestamp": model_data["timestamp"],
+        })
 
 
 
@@ -108,15 +121,15 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
 
     # ==================== Budget Management ====================
 
-    async def _get_or_create_user_budget(
+    async def _get_user_budget(
         self,
         api_key: Optional[str],
         model: str,
         workload: float,
-    ) -> dict:
+    ) -> CacheDataUser:
         """Get existing budget from cache or create new one."""
         if api_key is None:
-            return {"requests_left": -1}
+            raise HTTPException(status_code=429, detail={"error": "API key not provided"})
 
         cache_key = f"{api_key}:{model}"
         cached_data = await self.cache.async_get_cache(cache_key) # dict keys model_name, requests_left, timestamp
@@ -131,12 +144,12 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         cache: DualCache,
         cache_key: str,
         model: str,
-    ) -> dict:
+    ) -> CacheDataUser:
         """Initialize a new user budget entry in cache."""
-        budget_data = {
-            "model": model,
+        budget_data: CacheDataUser = {
+            "model_name": model,
             "requests_left": DEFAULT_REQUEST_BUDGET,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc),
+            "last_refill": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         await cache.async_set_cache(cache_key, budget_data)
         return budget_data
@@ -145,25 +158,23 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         self,
         cache: DualCache,
         cache_key: str,
-        cached_data: dict,
+        cached_data: CacheDataUser,
         workload: float,
-    ) -> dict:
+    ) -> CacheDataUser:
         """Refill user budget based on elapsed time and current workload."""
         now = datetime.datetime.now(datetime.timezone.utc)
-        timestamp = cached_data.get("timestamp")
-
-        if timestamp is None:
-            return cached_data
-
+        timestamp = datetime.datetime.fromisoformat(cached_data["last_refill"])
         elapsed_seconds = (now - timestamp).total_seconds()
-        refill_rate = self._calculate_refill_rate(workload)
-        requests_to_add = int(elapsed_seconds * refill_rate) * 0 #TODO FOR TESTING ONLY
 
-        current_requests = cached_data.get("requests_left", 0)
-        updated_data = {
-            "model": cached_data.get("model"),
+        refill_rate = self._calculate_refill_rate(workload)
+        requests_to_add = int(elapsed_seconds * refill_rate)
+
+        current_requests = cached_data["requests_left"]
+
+        updated_data: CacheDataUser = {
+            "model_name": cached_data["model_name"],
             "requests_left": current_requests + requests_to_add,
-            "timestamp": now,
+            "last_refill": now.isoformat(),
         }
 
         await cache.async_set_cache(cache_key, updated_data)
@@ -202,10 +213,35 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
     async def _get_model_workload(self, model: str) -> float:
         """Calculate current workload for a model."""
         tokens_used = await self._fetch_tokens_used_in_window(model)
-        tpm_limit = self._get_model_tpm_limit(model)
-        return self._calculate_load(tokens_used, tpm_limit)
+        tpm_limit = self._get_model_tpm_limit(model) * 5 #window is 5 minutes
+        workload = self._calculate_load(tokens_used, tpm_limit)
+        data: CacheDataModel = {
+            "workload": workload,
+            "tokens_used": tokens_used,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        await self.cache.async_set_cache(model, data)
+
+        return workload
 
     async def _fetch_tokens_used_in_window(self, model: str) -> int:
+        cache_data: CacheDataModel = await self.cache.async_get_cache(model)
+        verbose_proxy_logger.debug(f"cache data workload {cache_data}")
+
+        if cache_data is None or cache_data["workload"] is None:
+            return await self.load_used_tokens(model)
+
+        cached_timestamp = datetime.datetime.fromisoformat(cache_data["timestamp"])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        age_minutes = (now - cached_timestamp).total_seconds() / 60
+
+
+        return await self.load_used_tokens(model) if age_minutes > WORKLOAD_WINDOW_MINUTES else cache_data["tokens_used"]
+
+
+
+
+    async def load_used_tokens(self, model: str) -> int:
         """Fetch total tokens used by model in the configured time window."""
         from litellm.proxy.proxy_server import prisma_client
 
