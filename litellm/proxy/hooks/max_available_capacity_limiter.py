@@ -17,17 +17,7 @@ else:
     InternalUsageCache = object
 
 
-from typing import TypedDict
 
-class CacheDataUser(TypedDict):
-    model_name: str
-    requests_left: int
-    last_refill: str  # ISO format string for JSON serialization
-
-class CacheDataModel(TypedDict):
-    workload: float
-    tokens_used: int
-    timestamp: str
 
 DEFAULT_REQUEST_BUDGET = 5
 DEFAULT_REFILL_RATE = 10  # request per second
@@ -57,32 +47,24 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
     ) -> None:
         model = data["model"]
         api_key = user_api_key_dict.api_key
+        cache_key = f"{api_key}:{model}"
 
-        verbose_proxy_logger.debug(f"MaxAvailableCapacityLimiter: pre call hook {datetime.datetime.now(datetime.timezone.utc).isoformat(sep=' ')}")
 
         try:
-            workload = await self._get_model_workload(model)
-            user_data = await self._get_user_budget(api_key, model, workload)
+            user_requests_left = await self._get_user_budget(model, cache_key)
         except HTTPException:
             raise
+
         except Exception as e:
 
             verbose_proxy_logger.error(f"Error in max available capacity rate limiter: {e}, allowing request")
             return None  # request allowed
 
-
-
-        if user_data["requests_left"] <= 0:
+        if user_requests_left <= 0:
             raise HTTPException(status_code=429, detail={"error": "Model capacity reached for {model}. Priority: {priority}, ..."})
 
-        updated_data: CacheDataUser = {
-            "model_name": user_data["model_name"],
-            "requests_left": user_data["requests_left"] - 1,
-            "last_refill": user_data["last_refill"],
-        }
+        await self.cache.async_set_cache(f"{cache_key}:requests_left", -1)
 
-        cache_key = f"{api_key}:{model}"
-        await self.cache.async_set_cache(cache_key, updated_data)
         return None
 
     async def async_post_call_success_hook(
@@ -98,101 +80,60 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
     async def async_log_success_event(
         self, kwargs, response_obj, start_time, end_time
     ) -> None:
-        verbose_proxy_logger.debug("Inside log success event")
 
         model = response_obj["model"]
-        user_api_key_dict: UserAPIKeyAuth = kwargs.get("litellm_params", {}).get("metadata", {}).get("user_api_key_auth", {})
-        api_key = user_api_key_dict.api_key
-        cache_key = f"{api_key}:{model}"
-
         total_tokens = response_obj.get("usage").get("total_tokens", 0)
 
-        model_data: CacheDataModel = await self.cache.async_get_cache(model)
-
-        await self.cache.async_set_cache(model, {
-            "workload": model_data["workload"],
-            "tokens_used": model_data["tokens_used"] + total_tokens,
-            "timestamp": model_data["timestamp"],
-        })
-
+        await self.cache.async_increment_cache(f"{model}:tokens_used", total_tokens)
+        return None
 
 
 
 
     # ==================== Budget Management ====================
 
-    async def _get_user_budget(
-        self,
-        api_key: Optional[str],
-        model: str,
-        workload: float,
-    ) -> CacheDataUser:
+    async def _get_user_budget(self, model: str, cache_key: str) -> int:
         """Get existing budget from cache or create new one."""
-        if api_key is None:
-            raise HTTPException(status_code=429, detail={"error": "API key not provided"})
+        requests_left = await self.cache.async_get_cache(f"{cache_key}:requests_left")
 
-        cache_key = f"{api_key}:{model}"
-        cached_data = await self.cache.async_get_cache(cache_key) # dict keys model_name, requests_left, timestamp
+        return await self._create_user_budget(cache_key) if requests_left is None \
+            else  await self._refill_user_budget(cache_key, model)
 
-        if cached_data is None:
-            return await self._create_user_budget(self.cache, cache_key, model)
+    async def _create_user_budget(self, cache_key: str) -> int:
 
-        return await self._refill_user_budget(self.cache, cache_key, cached_data, workload)
+        await self.cache.async_set_cache(f"{cache_key}:requests_left", DEFAULT_REQUEST_BUDGET)
+        await self.cache.async_set_cache(f"{cache_key}:last_refill", datetime.datetime.now(datetime.timezone.utc).isoformat())
 
-    async def _create_user_budget(
-        self,
-        cache: DualCache,
-        cache_key: str,
-        model: str,
-    ) -> CacheDataUser:
-        """Initialize a new user budget entry in cache."""
-        budget_data: CacheDataUser = {
-            "model_name": model,
-            "requests_left": DEFAULT_REQUEST_BUDGET,
-            "last_refill": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        }
-        await cache.async_set_cache(cache_key, budget_data)
-        return budget_data
+        return DEFAULT_REQUEST_BUDGET
 
-    async def _refill_user_budget(
-        self,
-        cache: DualCache,
-        cache_key: str,
-        cached_data: CacheDataUser,
-        workload: float,
-    ) -> CacheDataUser:
+    async def _refill_user_budget(self, model: str, cache_key: str) -> int:
         """Refill user budget based on elapsed time and current workload."""
         now = datetime.datetime.now(datetime.timezone.utc)
-        timestamp = datetime.datetime.fromisoformat(cached_data["last_refill"])
+        timestamp = datetime.datetime.fromisoformat(await self.cache.async_get_cache(f"{cache_key}:timestamp"))
         elapsed_seconds = (now - timestamp).total_seconds()
 
-        refill_rate = self._calculate_refill_rate(workload)
+        refill_rate = await self._calculate_refill_rate(model)
         requests_to_add = int(elapsed_seconds * refill_rate)
+        new_requests = await self.cache.async_increment_cache(f"{cache_key}:requests_left", requests_to_add)
+        await self.cache.async_set_cache(f"{cache_key}:requests_left", now.isoformat())
 
-        current_requests = cached_data["requests_left"]
-
-        updated_data: CacheDataUser = {
-            "model_name": cached_data["model_name"],
-            "requests_left": current_requests + requests_to_add,
-            "last_refill": now.isoformat(),
-        }
-
-        await cache.async_set_cache(cache_key, updated_data)
-        return updated_data
+        return new_requests if new_requests is not None else 0
 
     # ==================== Refill Rate Calculation ====================
 
-    def _calculate_refill_rate(self, workload: float, base_rate: float = 0.1) -> float: # TODO check saturation in dynamic_rate_limiter_v3.py
+    async def _calculate_refill_rate(self, model: str, base_rate: float = 0.1) -> float: # TODO check saturation in dynamic_rate_limiter_v3.py
         """
         Calculate REQUEST refill rate based on system workload.
 
         Args:
-            workload: System load ratio (0.0 to 1.0)
+            model: model name
             base_rate: Base refill rate in REQUESTS per second (default 0.1 = 6 req/min)
 
         Returns:
             Effective refill rate in requests per second
         """
+        workload = await self._get_model_workload(model)
+
         if workload < 0.5:
             # Green zone: 20% bonus (0.12 req/s = 7.2 req/min)
             return base_rate * 1.2
@@ -215,28 +156,22 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         tokens_used = await self._fetch_tokens_used_in_window(model)
         tpm_limit = self._get_model_tpm_limit(model) * 5 #window is 5 minutes
         workload = self._calculate_load(tokens_used, tpm_limit)
-        data: CacheDataModel = {
-            "workload": workload,
-            "tokens_used": tokens_used,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        }
-        await self.cache.async_set_cache(model, data)
 
+        await self.cache.async_set_cache(f"{model}:workload", workload)
         return workload
 
     async def _fetch_tokens_used_in_window(self, model: str) -> int:
-        cache_data: CacheDataModel = await self.cache.async_get_cache(model)
-        verbose_proxy_logger.debug(f"cache data workload {cache_data}")
+        tokens_used_interval = await self.cache.async_get_cache(f"{model}:tokens")
+        cached_timestamp = await self.cache.async_get_cache(f"{model}:timestamp")
+        if tokens_used_interval is None:
+            return await self.load_used_tokens(model) # load tokens used from db
 
-        if cache_data is None or cache_data["workload"] is None:
-            return await self.load_used_tokens(model)
 
-        cached_timestamp = datetime.datetime.fromisoformat(cache_data["timestamp"])
         now = datetime.datetime.now(datetime.timezone.utc)
         age_minutes = (now - cached_timestamp).total_seconds() / 60
 
 
-        return await self.load_used_tokens(model) if age_minutes > WORKLOAD_WINDOW_MINUTES else cache_data["tokens_used"]
+        return await self.load_used_tokens(model) if age_minutes > WORKLOAD_WINDOW_MINUTES else tokens_used_interval
 
 
 
@@ -273,7 +208,7 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
 
         return deployment.litellm_params.tpm or 0
 
-    def _get_deployment(self, model: str) -> Optional[Deployment]:
+    def _get_deployment(self, model: str) -> Optional[Deployment]: # TODO CHECK IF NOT BETTER TO CACHE IT
         """Get deployment configuration for a model."""
         from litellm.proxy.proxy_server import llm_router
 
