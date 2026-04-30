@@ -1657,7 +1657,7 @@ class ProxyBaseLLMRequestProcessing:
         version: Optional[str] = None,
     ):
         """Raises ProxyException (OpenAI API compatible) if an exception is raised"""
-        verbose_proxy_logger.exception(
+        verbose_proxy_logger.error(
             f"litellm.proxy.proxy_server._handle_llm_api_exception(): Exception occured - {str(e)}"
         )
         # Allow callbacks to transform the error response
