@@ -519,20 +519,6 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 "descriptor_key": descriptor_key,
             }
 
-        ## CHECK IN-MEMORY CACHE
-        cache_values = await self.internal_usage_cache.async_batch_get_cache(
-            keys=keys_to_fetch,
-            parent_otel_span=parent_otel_span,
-            local_only=True,
-        )
-
-        if cache_values is not None:
-            rate_limit_response = self.is_cache_list_over_limit(
-                keys_to_fetch, cache_values, key_metadata
-            )
-            if rate_limit_response["overall_code"] == "OVER_LIMIT":
-                return rate_limit_response
-
         ## IF under limit in-memory, check Redis
         if read_only:
             # READ-ONLY MODE: Just read current values without incrementing
