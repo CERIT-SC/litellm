@@ -8,7 +8,6 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.router import Deployment
 
-
 if TYPE_CHECKING:
     from litellm.proxy.utils import InternalUsageCache as _InternalUsageCache
 
@@ -17,11 +16,50 @@ else:
     InternalUsageCache = object
 
 
+MAX_REQUEST_BUDGET = 5
+BASE_REFILL_RATE = 0.1  # requests per second (6 req/min)
+WORKLOAD_WINDOW_MINUTES = 5
+WORKLOAD_REFRESH_SECONDS = 30
 
+REFILL_AND_DECREMENT_LUA = """
+local requests_key = KEYS[1]
+local timestamp_key = KEYS[2]
+local refill_rate = tonumber(ARGV[1])
+local max_budget = tonumber(ARGV[2])
 
-DEFAULT_REQUEST_BUDGET = 5
-DEFAULT_REFILL_RATE = 10  # request per second
-WORKLOAD_WINDOW_MINUTES = 5 #WORKLOAD IN PAST X MINUTES
+local requests_left = redis.call('GET', requests_key)
+local stored_timestamp = redis.call('GET', timestamp_key)
+
+local time_result = redis.call('TIME')
+local current_time = tonumber(time_result[1])
+
+if requests_left == false then
+    -- First time: initialize at max_budget, then try to consume 1
+    redis.call('SET', requests_key, max_budget - 1)
+    redis.call('SET', timestamp_key, current_time)
+    return 1
+end
+
+requests_left = tonumber(requests_left)
+
+if stored_timestamp == false then
+    redis.call('SET', timestamp_key, current_time)
+else
+    local elapsed_seconds = current_time - tonumber(stored_timestamp)
+    local requests_to_add = elapsed_seconds * refill_rate
+    requests_left = math.min(requests_left + requests_to_add, max_budget)
+    redis.call('SET', timestamp_key, current_time)
+end
+
+-- Check and decrement
+if requests_left >= 1 then
+    redis.call('SET', requests_key, requests_left - 1)
+    return 1
+end
+
+redis.call('SET', requests_key, requests_left)
+return 0
+"""
 
 
 class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
@@ -35,6 +73,10 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
     def __init__(self, internal_usage_cache: InternalUsageCache):
         self.cache  = internal_usage_cache.dual_cache
         self._prev_load: float = 0.0
+        if self.cache.redis_cache is None:
+            raise Exception("Redis cache is required for MaxAvailableCapacityLimiter")
+
+        self._refill_and_decrement_script = self.cache.redis_cache.async_register_script(REFILL_AND_DECREMENT_LUA)
 
     # ==================== Hooks ====================
 
@@ -49,23 +91,15 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         api_key = user_api_key_dict.api_key
         cache_key = f"{api_key}:{model}"
 
-
         try:
-            user_requests_left = await self._get_user_budget(model, cache_key)
-        except HTTPException:
-            raise
-
+            granted = await self._try_consume_budget(model, cache_key)
         except Exception as e:
-
             verbose_proxy_logger.error(f"Error in max available capacity rate limiter: {e}, allowing request")
-            return None  # request allowed
+            raise HTTPException(status_code=500, detail={"error": "Internal error in MaxAvailableCapacityLimiter"})
 
-        if user_requests_left <= 0:
-            raise HTTPException(status_code=429, detail={"error": "Model capacity reached for {model}. Priority: {priority}, ..."})
+        if not granted:
+            raise HTTPException(status_code=429, detail={"error": f"Model capacity reached for {model}."})
 
-        await self.cache.async_set_cache(f"{cache_key}:requests_left", -1)
-
-        return None
 
     async def async_post_call_success_hook(
         self,
@@ -80,44 +114,33 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
     async def async_log_success_event(
         self, kwargs, response_obj, start_time, end_time
     ) -> None:
-
         model = response_obj["model"]
         total_tokens = response_obj.get("usage").get("total_tokens", 0)
 
         await self.cache.async_increment_cache(f"{model}:tokens_used", total_tokens)
-        return None
-
-
-
 
     # ==================== Budget Management ====================
 
-    async def _get_user_budget(self, model: str, cache_key: str) -> int:
-        """Get existing budget from cache or create new one."""
-        requests_left = await self.cache.async_get_cache(f"{cache_key}:requests_left")
+    async def _try_consume_budget(self, model: str, cache_key: str) -> bool:
+        """Refill user budget and atomically consume one request using a Lua script in Redis.
 
-        return await self._create_user_budget(cache_key) if requests_left is None \
-            else  await self._refill_user_budget(cache_key, model)
+        Returns True if the request was granted, False if denied.
+        """
+        refill_rate = await self._calculate_refill_rate(model, base_rate=BASE_REFILL_RATE)
 
-    async def _create_user_budget(self, cache_key: str) -> int:
+        redis_cache = self.cache.redis_cache
+        if redis_cache is None:
+            raise Exception("Redis cache is not configured for MaxAvailableCapacityLimiter")
 
-        await self.cache.async_set_cache(f"{cache_key}:requests_left", DEFAULT_REQUEST_BUDGET)
-        await self.cache.async_set_cache(f"{cache_key}:last_refill", datetime.datetime.now(datetime.timezone.utc).isoformat())
+        requests_key = f"{cache_key}:requests_left"
+        timestamp_key = f"{cache_key}:timestamp"
 
-        return DEFAULT_REQUEST_BUDGET
+        result = await self._refill_and_decrement_script(
+            keys=[requests_key, timestamp_key],
+            args=[refill_rate, MAX_REQUEST_BUDGET],
+        )
 
-    async def _refill_user_budget(self, model: str, cache_key: str) -> int:
-        """Refill user budget based on elapsed time and current workload."""
-        now = datetime.datetime.now(datetime.timezone.utc)
-        timestamp = datetime.datetime.fromisoformat(await self.cache.async_get_cache(f"{cache_key}:timestamp"))
-        elapsed_seconds = (now - timestamp).total_seconds()
-
-        refill_rate = await self._calculate_refill_rate(model)
-        requests_to_add = int(elapsed_seconds * refill_rate)
-        new_requests = await self.cache.async_increment_cache(f"{cache_key}:requests_left", requests_to_add)
-        await self.cache.async_set_cache(f"{cache_key}:requests_left", now.isoformat())
-
-        return new_requests if new_requests is not None else 0
+        return int(result) == 1
 
     # ==================== Refill Rate Calculation ====================
 
@@ -154,29 +177,32 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
     async def _get_model_workload(self, model: str) -> float:
         """Calculate current workload for a model."""
         tokens_used = await self._fetch_tokens_used_in_window(model)
-        tpm_limit = self._get_model_tpm_limit(model) * 5 #window is 5 minutes
+        tpm_limit = self._get_model_tpm_limit(model) * WORKLOAD_WINDOW_MINUTES
         workload = self._calculate_load(tokens_used, tpm_limit)
 
-        await self.cache.async_set_cache(f"{model}:workload", workload)
+        await self.cache.async_set_cache(f"{model}:workload", workload) # TODO: never used
         return workload
 
     async def _fetch_tokens_used_in_window(self, model: str) -> int:
-        tokens_used_interval = await self.cache.async_get_cache(f"{model}:tokens")
         cached_timestamp = await self.cache.async_get_cache(f"{model}:timestamp")
-        if tokens_used_interval is None:
-            return await self.load_used_tokens(model) # load tokens used from db
+        tokens_used_last_update = None
+        if cached_timestamp is not None:
+            tokens_used_last_update = float(cached_timestamp)
+        
+        now = datetime.datetime.now().timestamp()
+        if tokens_used_last_update is not None and (now - tokens_used_last_update) < WORKLOAD_REFRESH_SECONDS:
+            cached_tokens = await self.cache.async_get_cache(f"{model}:tokens")
+            if cached_tokens is not None:
+                return int(cached_tokens)
 
+        used_tokens = await self._load_used_tokens(model)
 
-        now = datetime.datetime.now(datetime.timezone.utc)
-        age_minutes = (now - cached_timestamp).total_seconds() / 60
+        await self.cache.async_set_cache(f"{model}:tokens", used_tokens)
+        await self.cache.async_set_cache(f"{model}:timestamp", now)
 
+        return used_tokens
 
-        return await self.load_used_tokens(model) if age_minutes > WORKLOAD_WINDOW_MINUTES else tokens_used_interval
-
-
-
-
-    async def load_used_tokens(self, model: str) -> int:
+    async def _load_used_tokens(self, model: str) -> int:
         """Fetch total tokens used by model in the configured time window."""
         from litellm.proxy.proxy_server import prisma_client
 
@@ -194,19 +220,18 @@ class _PROXY_MaxAvailableCapacityLimiter(CustomLogger):
         if db_response is None or len(db_response) == 0:
             return 0
 
-        return int(db_response[0]["total"])
+        return int(db_response[0].get("total", 0))
 
     def _get_model_tpm_limit(self, model: str) -> int:
         """Get TPM (tokens per minute) limit for a model deployment."""
         deployment = self._get_deployment(model)
 
-        if deployment is None:
-            return 0
+        if deployment is None or deployment.model_info is None:
+            raise Exception(f"Deployment or model info not found for model: {model}")
 
-        if deployment.litellm_params is None:
-            return 0
+        max_tpm = int(deployment.model_info["max_tpm"])
 
-        return deployment.litellm_params.tpm or 0
+        return max_tpm
 
     def _get_deployment(self, model: str) -> Optional[Deployment]: # TODO CHECK IF NOT BETTER TO CACHE IT
         """Get deployment configuration for a model."""
