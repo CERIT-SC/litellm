@@ -378,10 +378,7 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
         """
         max_parallel_requests = user_api_key_dict.max_parallel_requests
         if max_parallel_requests is None:
-            return True  # No limit for this user, allow request to proceed
-
-        if max_parallel_requests <= self.max_concurrent_requests:
-            return True
+            return False  # No limit for this user, allow request to proceed
         
         return True
 
