@@ -22,7 +22,7 @@ except ImportError:
 # List of all available hooks that can be enabled
 PROXY_HOOKS = {
     "max_budget_limiter": _PROXY_MaxBudgetLimiter,
-    "parallel_request_limiter": _PROXY_MaxParallelRequestsHandler_v3,
+    #"parallel_request_limiter": _PROXY_MaxParallelRequestsHandler_v3,
     "cache_control_check": _PROXY_CacheControlCheck,
     "responses_id_security": ResponsesIDSecurity,
     "litellm_skills": SkillsInjectionHook,
@@ -46,7 +46,7 @@ def get_proxy_hook(
         Literal[
             "max_budget_limiter",
             "managed_files",
-            "parallel_request_limiter",
+            #"parallel_request_limiter",
             "cache_control_check",
             "request_queue_limiter",
         ],
