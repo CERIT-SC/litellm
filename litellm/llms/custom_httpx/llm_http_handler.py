@@ -421,7 +421,11 @@ class BaseLLMHTTPHandler:
         )
 
         if extra_body is not None:
+            request_max_tokens = data.get("max_tokens")
             data = {**data, **extra_body}
+            # Apply request max_tokens only if it's lower than extra_body's max_tokens
+            if request_max_tokens is not None and "max_tokens" in extra_body:
+                data["max_tokens"] = min(request_max_tokens, extra_body["max_tokens"])
 
         headers, signed_json_body = provider_config.sign_request(
             headers=headers,
