@@ -235,7 +235,7 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
 
     def _get_request_id(self, data: dict) -> str:
         """Extract the request ID from the data dictionary if available."""
-        return data["metadata"]["headers"].get("x-request-id") or str(uuid.uuid4())
+        return str(uuid.uuid4())
 
     def _set_counter_incremented_flag(self, data: dict) -> None:
         """Set a flag in metadata to indicate the counter was incremented.
