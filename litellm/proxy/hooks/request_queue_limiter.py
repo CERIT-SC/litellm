@@ -519,11 +519,12 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
             # On error, allow the request to proceed
             return None
 
-    async def async_post_call_success_hook(
+    async def async_log_success_event(
         self,
-        data: dict,
-        user_api_key_dict: UserAPIKeyAuth,
-        response: Any,
+        kwargs: dict,
+        response_obj: Any,
+        start_time: Any,
+        end_time: Any,
     ) -> None:
         """
         Post-call success hook to release a slot when a request completes successfully.
@@ -532,24 +533,34 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
         the CHECK_AND_PROMOTE_LUA script during polling in _wait_for_slot().
         
         Args:
-            data: Request data dictionary
-            user_api_key_dict: User API key authentication dictionary
-            response: The response object from the LLM API
+            kwargs: Request kwargs from the logging system
+            response_obj: The response object from the LLM API
+            start_time: Request start time
+            end_time: Request end time
         """
-
-        counter_incremented = data.get("metadata", {}).get("user_api_key_auth_metadata", {}).get("request_queue_counter_incremented", False)
-        if not counter_incremented:
-            verbose_proxy_logger.debug(
-                "RequestQueueLimiter: Counter was not incremented for this request, skipping slot release - success"
-            )
-            return
+        verbose_proxy_logger.debug(
+            "RequestQueueLimiter: In async_log_success_event"
+        )
 
         try:
-            # Get the API key from the user_api_key_dict
-            api_key = getattr(user_api_key_dict, "api_key", None)
+            standard_logging_object = kwargs.get("standard_logging_object") or {}
+            standard_logging_metadata = standard_logging_object.get("metadata") or {}
+            api_key = standard_logging_metadata.get("user_api_key_hash")
+            
             if not api_key:
                 verbose_proxy_logger.debug(
-                    "RequestQueueLimiter: No API key found in success hook, skipping slot release"
+                    "RequestQueueLimiter: No API key found in success event, skipping slot release"
+                )
+                return
+            
+            # Check if the counter was incremented for this request
+            # The flag is stored in user_api_key_auth_metadata which is passed from pre_call_hook
+            user_api_key_auth_metadata = standard_logging_metadata.get("user_api_key_auth_metadata") or {}
+            counter_incremented = user_api_key_auth_metadata.get("request_queue_counter_incremented", False)
+            
+            if not counter_incremented:
+                verbose_proxy_logger.debug(
+                    f"RequestQueueLimiter: Counter was not incremented for this request, skipping decrement"
                 )
                 return
             
@@ -581,7 +592,7 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                 
         except Exception as e:
             verbose_proxy_logger.exception(
-                f"RequestQueueLimiter: Error in post_call_success_hook: {str(e)}"
+                f"RequestQueueLimiter: Error in async_log_success_event: {str(e)}"
             )
 
     async def async_log_failure_event(
@@ -605,16 +616,13 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
         """
 
         try:
-            # Get metadata from standard_logging_object
             standard_logging_object = kwargs.get("standard_logging_object") or {}
             standard_logging_metadata = standard_logging_object.get("metadata") or {}
-            
-            # Get the API key from metadata
             api_key = standard_logging_metadata.get("user_api_key_hash")
             
             if not api_key:
                 verbose_proxy_logger.debug(
-                    "RequestQueueLimiter: No API key found in failure event, skipping slot release - failure"
+                    "RequestQueueLimiter: No API key found in failure event, skipping slot release"
                 )
                 return
             
