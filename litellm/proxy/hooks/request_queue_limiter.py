@@ -10,13 +10,12 @@ This module provides a queue-based rate limiting mechanism that:
 
 The queue is GLOBAL per API key, not per-model.
 
-Key principle: The queue list stores ONLY pending request IDs. The running counter
-(separate key) tracks executing requests. No markers are stored in the queue.
+Key principle: The queue list stores ONLY pending request IDs. The running key
+stores a list of currently running request IDs. No markers are stored in the queue.
 """
 
 import asyncio
 import os
-import uuid
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from fastapi import HTTPException
@@ -56,7 +55,7 @@ local request_id = ARGV[3]
 local queue_key_ttl = tonumber(ARGV[4])
 
 -- Get current running count
-local running_count = tonumber(redis.call('GET', running_key)) or 0
+local running_count = redis.call('LLEN', running_key)
 
 -- Get current total count (running + queued)
 local queue_length = redis.call('LLEN', queue_key)
@@ -64,8 +63,8 @@ local total_count = running_count + queue_length
 
 -- Check if we can run immediately
 if running_count < max_concurrent then
-    -- Increment running count and set TTL. Queue stores only pending requests.
-    redis.call('INCR', running_key)
+    -- Add request ID to running list and set TTL. Queue stores only pending requests.
+    redis.call('RPUSH', running_key, request_id)
     redis.call('EXPIRE', running_key, queue_key_ttl)
     return -1
 end
@@ -83,19 +82,18 @@ return -2
 """
 
 
-# This decrements the running count only. Queue promotion is handled by polling in _wait_for_slot().
+# This removes the request ID from the running list. Queue promotion is handled by polling in _wait_for_slot().
 # ARGV[1] = queue_key_ttl (TTL in seconds)
+# ARGV[2] = request_id
 RELEASE_SLOT_LUA = """
 local running_key = KEYS[1]
 local queue_key = KEYS[2]
 local queue_key_ttl = tonumber(ARGV[1])
+local request_id = ARGV[2]
 
--- Decrement running count and refresh TTL (don't go below 0)
-local running_count = tonumber(redis.call('GET', running_key)) or 0
-if running_count > 0 then
-    redis.call('DECR', running_key)
-    redis.call('EXPIRE', running_key, queue_key_ttl)
-end
+-- Remove the request ID from the running list and refresh TTL
+redis.call('LREM', running_key, 1, request_id)
+redis.call('EXPIRE', running_key, queue_key_ttl)
 
 -- Queue promotion is handled by CHECK_AND_PROMOTE_LUA during polling in _wait_for_slot().
 -- We do not manipulate the queue here to avoid race conditions.
@@ -111,7 +109,7 @@ local max_concurrent = tonumber(ARGV[2])
 local queue_key_ttl = tonumber(ARGV[3])
 
 -- Get current running count
-local running_count = tonumber(redis.call('GET', running_key)) or 0
+local running_count = redis.call('LLEN', running_key)
 
 -- Check if we can run now
 if running_count >= max_concurrent then
@@ -121,9 +119,9 @@ end
 -- Check if this request is at the front of the queue
 local first_item = redis.call('LINDEX', queue_key, 0)
 if first_item == request_id then
-    -- Remove from queue and increment running count, refresh TTL on both keys
+    -- Remove from queue and add request ID to running list, refresh TTL on both keys
     redis.call('LPOP', queue_key)
-    redis.call('INCR', running_key)
+    redis.call('RPUSH', running_key, request_id)
     redis.call('EXPIRE', running_key, queue_key_ttl)
     redis.call('EXPIRE', queue_key, queue_key_ttl)
     return 1
@@ -218,35 +216,24 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
         self, api_key: str
     ) -> tuple[str, str]:
         """
-        Get the Redis keys for the running counter, queue, and notify channel for an API key.
-        
-        Uses {} hash tag syntax for Redis cluster compatibility.
+        Get the Redis keys for the running list and queue for an API key.
         
         Args:
             api_key: The API key to get keys for
             
         Returns:
-            Tuple of (running_key, queue_key, notify_channel)
+            Tuple of (running_key, queue_key)
         """
         # Use hash tag to ensure keys are in same slot for Redis cluster
         running_key = f"{{{api_key}}}:queue:running"
         queue_key = f"{{{api_key}}}:queue:pending"
         return running_key, queue_key
 
-    def _get_request_id(self, data: dict) -> str:
+    def _get_request_id(self, data: dict) -> str | None:
         """Extract the request ID from the data dictionary if available."""
-        return str(uuid.uuid4())
-
-    def _set_counter_incremented_flag(self, data: dict) -> None:
-        """Set a flag in metadata to indicate the counter was incremented.
+        request_id = data.get("litellm_call_id", None)
         
-        This flag is passed through to async_log_failure_event via the standard_logging_object.
-        """
-        if "metadata" not in data:
-            data["metadata"] = {}
-        if "user_api_key_auth_metadata" not in data["metadata"]:
-            data["metadata"]["user_api_key_auth_metadata"] = {}
-        data["metadata"]["user_api_key_auth_metadata"]["request_queue_counter_incremented"] = True
+        return str(request_id) or None
 
     async def _wait_for_slot(
         self,
@@ -304,9 +291,6 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                         verbose_proxy_logger.debug(
                             f"RequestQueueLimiter: Request {request_id[:8]} promoted to running after waiting"
                         )
-                        # Set flag to indicate counter was incremented when queued request was promoted
-                        # Note: We can't directly set the flag here since we don't have access to `data` dict
-                        # The flag will be set in async_pre_call_hook after _wait_for_slot returns successfully
                         return  # Slot acquired, exit wait loop
                     
                     # Still waiting, update position info
@@ -314,10 +298,15 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                         # Get current queue position
                         if self.internal_usage_cache.dual_cache.redis_cache is not None:
                             queue_items = self.internal_usage_cache.dual_cache.redis_cache.redis_client.lrange(queue_key, 0, -1)
+                            current_position = None
                             for idx, item in enumerate(queue_items):
                                 if item == request_id:
                                     current_position = idx + 1
                                     break
+                            if current_position is not None:
+                                verbose_proxy_logger.debug(
+                                    f"RequestQueueLimiter: Request {request_id[:8]} at queue position {current_position}"
+                                )
                 except Exception as e:
                     verbose_proxy_logger.debug(
                         f"RequestQueueLimiter: Check/promote script failed: {str(e)}"
@@ -425,6 +414,11 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                 return None
             
             request_id = self._get_request_id(data)
+            if not request_id:
+                verbose_proxy_logger.debug(
+                    "RequestQueueLimiter: No request ID found, skipping queue check"
+                )
+                return None
             
             # Get Redis keys for this API key
             running_key, queue_key = self._get_queue_keys(api_key)
@@ -476,12 +470,10 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                     )
                 
                 elif result == -1:
-                    # Request can run immediately - counter was incremented by Lua script
+                    # Request can run immediately - request ID was added to running list by Lua script
                     verbose_proxy_logger.debug(
                         f"RequestQueueLimiter: Request {request_id[:8]} allowed to run immediately for API key {api_key[:8]}"
                     )
-                    # Set flag to indicate counter was incremented
-                    self._set_counter_incremented_flag(data)
                     return None
                 else:
                     # Request is queued, result is the queue position
@@ -496,8 +488,7 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                     verbose_proxy_logger.debug(
                         f"RequestQueueLimiter: Request {request_id[:8]} acquired slot after waiting"
                     )
-                    # Counter was incremented when queued request was promoted via CHECK_AND_PROMOTE_LUA
-                    self._set_counter_incremented_flag(data)
+                    # Request ID was added to running list when queued request was promoted via CHECK_AND_PROMOTE_LUA
                     return None
                     
             except HTTPException:
@@ -529,7 +520,7 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
         """
         Post-call success hook to release a slot when a request completes successfully.
         
-        This hook decrements the running count only. Queue promotion is handled by
+        This hook removes the request ID from the running list. Queue promotion is handled by
         the CHECK_AND_PROMOTE_LUA script during polling in _wait_for_slot().
         
         Args:
@@ -553,14 +544,10 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                 )
                 return
             
-            # Check if the counter was incremented for this request
-            # The flag is stored in user_api_key_auth_metadata which is passed from pre_call_hook
-            user_api_key_auth_metadata = standard_logging_metadata.get("user_api_key_auth_metadata") or {}
-            counter_incremented = user_api_key_auth_metadata.get("request_queue_counter_incremented", False)
-            
-            if not counter_incremented:
+            request_id = self._get_request_id(standard_logging_object)
+            if request_id is None:
                 verbose_proxy_logger.debug(
-                    f"RequestQueueLimiter: Counter was not incremented for this request, skipping decrement"
+                    "RequestQueueLimiter: No request ID found, skipping slot release"
                 )
                 return
             
@@ -576,7 +563,7 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                 try:
                     result = await self._release_slot_script(
                         keys=[running_key, queue_key],
-                        args=[self.max_queue_wait_time],
+                        args=[self.max_queue_wait_time, request_id],
                     )
                     verbose_proxy_logger.debug(
                         f"RequestQueueLimiter: Slot released for API key {api_key[:8]}, next queued: {result}"
@@ -605,7 +592,7 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
         """
         Log failure event to release a slot when a request fails.
         
-        This hook decrements the running count only. Queue promotion is handled by
+        This hook removes the request ID from the running list. Queue promotion is handled by
         the CHECK_AND_PROMOTE_LUA script during polling in _wait_for_slot().
         
         Args:
@@ -614,6 +601,10 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
             start_time: Request start time
             end_time: Request end time
         """
+
+        verbose_proxy_logger.debug(
+            "RequestQueueLimiter: In async_log_failure_event"
+        )
 
         try:
             standard_logging_object = kwargs.get("standard_logging_object") or {}
@@ -626,14 +617,10 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                 )
                 return
             
-            # Check if the counter was incremented for this request
-            # The flag is stored in user_api_key_auth_metadata which is passed from pre_call_hook
-            user_api_key_auth_metadata = standard_logging_metadata.get("user_api_key_auth_metadata") or {}
-            counter_incremented = user_api_key_auth_metadata.get("request_queue_counter_incremented", False)
-            
-            if not counter_incremented:
+            request_id = self._get_request_id(standard_logging_object)
+            if request_id is None:
                 verbose_proxy_logger.debug(
-                    f"RequestQueueLimiter: Counter was not incremented for this request, skipping decrement"
+                    "RequestQueueLimiter: No request ID found, skipping slot release"
                 )
                 return
             
@@ -649,7 +636,7 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                 try:
                     result = await self._release_slot_script(
                         keys=[running_key, queue_key],
-                        args=[self.max_queue_wait_time],
+                        args=[self.max_queue_wait_time, request_id],
                     )
                     verbose_proxy_logger.debug(
                         f"RequestQueueLimiter: Slot released for API key {api_key[:8]} after failure, next queued: {result}"
