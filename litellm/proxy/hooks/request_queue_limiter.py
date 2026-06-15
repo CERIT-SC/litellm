@@ -94,6 +94,22 @@ local request_id = ARGV[2]
 -- Remove the request ID from the running list and refresh TTL
 redis.call('LREM', running_key, 1, request_id)
 redis.call('EXPIRE', running_key, queue_key_ttl)
+local next_request = redis.call('LPOP', queue_key)
+if next_request then
+    -- Add request ID to running list and set TTL. Queue stores only pending requests.
+    redis.call('RPUSH', running_key, next_request)
+    redis.call('EXPIRE', next_request, queue_key_ttl)
+    redis.call(
+        'XADD',
+        next_request,
+        '*',
+        'event', 'slot_released',
+    )
+    
+end
+redis.call('LREM', running_key, 1, request_id)
+redis.call('EXPIRE', running_key, queue_key_ttl)
+
 
 -- Queue promotion is handled by CHECK_AND_PROMOTE_LUA during polling in _wait_for_slot().
 -- We do not manipulate the queue here to avoid race conditions.
@@ -239,6 +255,7 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
         self,
         api_key: str,
         request_id: str,
+        max_parallel_requests
     ) -> None:
         """
         Wait for a slot to become available in the queue.
@@ -254,65 +271,38 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
             HTTPException: 429 if the request times out waiting in queue
         """
         running_key, queue_key = self._get_queue_keys(api_key)
+        async_redis = self.internal_usage_cache.dual_cache.redis_cache.init_async_client()
+        messages = await async_redis.xread(
+            streams={request_id: "0"},
+            block=self.max_queue_wait_time * 1000,
+            count=1,
+        )
 
-        event_loop = asyncio.get_event_loop()
-        start_time = event_loop.time()
-        
-        while True:
-            # Check elapsed time
-            elapsed = event_loop.time() - start_time
-            if elapsed > self.max_queue_wait_time:
-                verbose_proxy_logger.warning(
-                    f"RequestQueueLimiter: Request {request_id[:8]} timed out waiting in queue after {elapsed:.1f}s"
+        if not messages:
+            idx = await async_redis.lpos(running_key, request_id)
+            if idx is not None:
+                verbose_proxy_logger.debug(
+                    f"RequestQueueLimiter: Request {request_id[:8]} was promoted during timeout check"
                 )
-                # Clean up this request from the queue
-                await self._cleanup_queued_request(api_key, request_id)
-                raise HTTPException(
-                    status_code=429,
-                    detail=(
-                        f"Request timed out waiting in queue. Waited {elapsed:.1f}s. "
-                        f"Maximum wait time is {self.max_queue_wait_time}s."
-                    ),
-                    headers={
-                        "retry-after": "10",
-                        "x-rate-limit-queue-status": "timeout",
-                    },
-                )
-            
-            # Check if we can run now
-            if self._check_and_promote_script is not None:
-                try:
-                    result = await self._check_and_promote_script(
-                        keys=[running_key, queue_key],
-                        args=[request_id, self.max_concurrent_requests, self.max_queue_wait_time],
-                    )
-                    
-                    if result == 1:
-                        verbose_proxy_logger.debug(
-                            f"RequestQueueLimiter: Request {request_id[:8]} promoted to running after waiting"
-                        )
-                        return  # Slot acquired, exit wait loop
-                    
-                    # Still waiting, update position info
-                    if result == 0:
-                        # Get current queue position
-                        if self.internal_usage_cache.dual_cache.redis_cache is not None:
-                            queue_items = self.internal_usage_cache.dual_cache.redis_cache.redis_client.lrange(queue_key, 0, -1)
-                            current_position = None
-                            for idx, item in enumerate(queue_items):
-                                if item == request_id:
-                                    current_position = idx + 1
-                                    break
-                            if current_position is not None:
-                                verbose_proxy_logger.debug(
-                                    f"RequestQueueLimiter: Request {request_id[:8]} at queue position {current_position}"
-                                )
-                except Exception as e:
-                    verbose_proxy_logger.debug(
-                        f"RequestQueueLimiter: Check/promote script failed: {str(e)}"
-                    )
+                return None
+            verbose_proxy_logger.warning(
+                f"RequestQueueLimiter: Request {request_id[:8]} timed out waiting in queue after {self.max_queue_wait_time}s"
+            )
+            # Clean up this request from the queue
+            await self._cleanup_queued_request(api_key, request_id)
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Request timed out waiting in queue. Waited {self.max_queue_wait_time}s. "
 
-            await asyncio.sleep(self.queue_poll_interval)
+                ),
+                headers={
+                    "retry-after": "10",
+                    "x-rate-limit-queue-status": "timeout",
+                },
+            )
+
+
 
     async def _cleanup_queued_request(
         self,
@@ -370,6 +360,74 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
             return False  # No limit for this user, allow request to proceed
         
         return True
+
+
+    async def try_aquiare_slot(self, running_key, queue_key, request_id, max_parallel_requests, api_key):
+        try:
+            result = await self._try_acquire_script(
+                keys=[running_key, queue_key],
+                args=[
+                    self.max_concurrent_requests,
+                    max_parallel_requests,
+                    request_id,
+                    self.max_queue_wait_time,
+                ],
+            )
+
+            verbose_proxy_logger.debug(
+                f"RequestQueueLimiter: Acquire result for {api_key[:8]}: {result}"
+            )
+
+            if result == -2:
+                # Queue is full, reject the request
+                verbose_proxy_logger.warning(
+                    f"RequestQueueLimiter: Queue full for API key {api_key[:8]}, rejecting request"
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        f"Request queue is full. Maximum {max_parallel_requests} "
+                        f"requests allowed (running + queued). Please try again later."
+                    ),
+                    headers={
+                        "retry-after": "30",
+                        "x-rate-limit-queue-status": "full",
+                        "x-rate-limit-max-concurrent": str(self.max_concurrent_requests),
+                        "x-rate-limit-max-total": str(max_parallel_requests),
+                    },
+                )
+
+            elif result == -1:
+                # Request can run immediately - request ID was added to running list by Lua script
+                verbose_proxy_logger.debug(
+                    f"RequestQueueLimiter: Request {request_id[:8]} allowed to run immediately for API key {api_key[:8]}"
+                )
+                return None
+            else:
+                # Request is queued, result is the queue position
+                queue_position = int(result)
+                verbose_proxy_logger.info(
+                    f"RequestQueueLimiter: Request {request_id[:8]} queued at position {queue_position} for API key {api_key[:8]}. Waiting for slot..."
+                )
+
+                # Wait for a slot to become available (internal waiting)
+                await self._wait_for_slot(api_key, request_id, max_parallel_requests)
+
+                verbose_proxy_logger.debug(
+                    f"RequestQueueLimiter: Request {request_id[:8]} acquired slot after waiting"
+                )
+                # Request ID was added to running list when queued request was promoted via CHECK_AND_PROMOTE_LUA
+                return None
+
+        except HTTPException:
+            # Re-raise HTTP exceptions
+            raise
+        except Exception as e:
+            verbose_proxy_logger.warning(
+                f"RequestQueueLimiter: Lua script execution failed: {str(e)}, falling back to allowing request"
+            )
+            # If Lua script fails, allow the request to proceed
+            return None
 
     async def async_pre_call_hook(
         self,
@@ -433,73 +491,9 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                     "RequestQueueLimiter: Lua scripts not registered, allowing request"
                 )
                 return None
-            
 
-            try:
-                result = await self._try_acquire_script(
-                    keys=[running_key, queue_key],
-                    args=[
-                        self.max_concurrent_requests,
-                        max_parallel_requests,
-                        request_id,
-                        self.max_queue_wait_time,
-                    ],
-                )
-                
-                verbose_proxy_logger.debug(
-                    f"RequestQueueLimiter: Acquire result for {api_key[:8]}: {result}"
-                )
-                
-                if result == -2:
-                    # Queue is full, reject the request
-                    verbose_proxy_logger.warning(
-                        f"RequestQueueLimiter: Queue full for API key {api_key[:8]}, rejecting request"
-                    )
-                    raise HTTPException(
-                        status_code=429,
-                        detail=(
-                            f"Request queue is full. Maximum {max_parallel_requests} "
-                            f"requests allowed (running + queued). Please try again later."
-                        ),
-                        headers={
-                            "retry-after": "30",
-                            "x-rate-limit-queue-status": "full",
-                            "x-rate-limit-max-concurrent": str(self.max_concurrent_requests),
-                            "x-rate-limit-max-total": str(max_parallel_requests),
-                        },
-                    )
-                
-                elif result == -1:
-                    # Request can run immediately - request ID was added to running list by Lua script
-                    verbose_proxy_logger.debug(
-                        f"RequestQueueLimiter: Request {request_id[:8]} allowed to run immediately for API key {api_key[:8]}"
-                    )
-                    return None
-                else:
-                    # Request is queued, result is the queue position
-                    queue_position = int(result)
-                    verbose_proxy_logger.info(
-                        f"RequestQueueLimiter: Request {request_id[:8]} queued at position {queue_position} for API key {api_key[:8]}. Waiting for slot..."
-                    )
-                    
-                    # Wait for a slot to become available (internal waiting)
-                    await self._wait_for_slot(api_key, request_id)
-                    
-                    verbose_proxy_logger.debug(
-                        f"RequestQueueLimiter: Request {request_id[:8]} acquired slot after waiting"
-                    )
-                    # Request ID was added to running list when queued request was promoted via CHECK_AND_PROMOTE_LUA
-                    return None
-                    
-            except HTTPException:
-                # Re-raise HTTP exceptions
-                raise
-            except Exception as e:
-                verbose_proxy_logger.warning(
-                    f"RequestQueueLimiter: Lua script execution failed: {str(e)}, falling back to allowing request"
-                )
-                # If Lua script fails, allow the request to proceed
-                return None
+            return await self.try_aquiare_slot(running_key, queue_key, request_id, max_parallel_requests, api_key)
+
         except HTTPException:
             # Re-raise HTTP exceptions
             raise
