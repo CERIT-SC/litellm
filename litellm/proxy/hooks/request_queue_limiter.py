@@ -99,51 +99,13 @@ if next_request then
     -- Add request ID to running list and set TTL. Queue stores only pending requests.
     redis.call('RPUSH', running_key, next_request)
     redis.call('EXPIRE', next_request, queue_key_ttl)
-    redis.call(
-        'XADD',
-        next_request,
-        '*',
-        'event', 'slot_released',
-    )
+    redis.call('XADD', next_request, '*', 'event', 'slot_released')
     
 end
-redis.call('LREM', running_key, 1, request_id)
-redis.call('EXPIRE', running_key, queue_key_ttl)
-
 
 -- Queue promotion is handled by CHECK_AND_PROMOTE_LUA during polling in _wait_for_slot().
 -- We do not manipulate the queue here to avoid race conditions.
 return 'OK'
-"""
-
-# Lua script for checking if a request is at the front of the queue and can run
-CHECK_AND_PROMOTE_LUA = """
-local running_key = KEYS[1]
-local queue_key = KEYS[2]
-local request_id = ARGV[1]
-local max_concurrent = tonumber(ARGV[2])
-local queue_key_ttl = tonumber(ARGV[3])
-
--- Get current running count
-local running_count = redis.call('LLEN', running_key)
-
--- Check if we can run now
-if running_count >= max_concurrent then
-    return 0
-end
-
--- Check if this request is at the front of the queue
-local first_item = redis.call('LINDEX', queue_key, 0)
-if first_item == request_id then
-    -- Remove from queue and add request ID to running list, refresh TTL on both keys
-    redis.call('LPOP', queue_key)
-    redis.call('RPUSH', running_key, request_id)
-    redis.call('EXPIRE', running_key, queue_key_ttl)
-    redis.call('EXPIRE', queue_key, queue_key_ttl)
-    return 1
-end
-
-return 0
 """
 
 # Lua script for cleaning up a queued request (removes from queue without affecting running count)
@@ -199,11 +161,6 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
                 self._release_slot_script = (
                     self.internal_usage_cache.dual_cache.redis_cache.async_register_script(
                         RELEASE_SLOT_LUA
-                    )
-                )
-                self._check_and_promote_script = (
-                    self.internal_usage_cache.dual_cache.redis_cache.async_register_script(
-                        CHECK_AND_PROMOTE_LUA
                     )
                 )
                 self._cleanup_queued_script = (
@@ -271,7 +228,14 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
             HTTPException: 429 if the request times out waiting in queue
         """
         running_key, queue_key = self._get_queue_keys(api_key)
-        async_redis = self.internal_usage_cache.dual_cache.redis_cache.init_async_client()
+        redis_cache = self.internal_usage_cache.dual_cache.redis_cache
+        if not redis_cache:
+            verbose_proxy_logger.debug(
+                f"RequestQueueLimiter: no RedisCache, allowing request"
+            )
+            return None
+
+        async_redis = redis_cache.init_async_client()
         messages = await async_redis.xread(
             streams={request_id: "0"},
             block=self.max_queue_wait_time * 1000,
@@ -364,6 +328,12 @@ class _PROXY_RequestQueueLimiter(CustomLogger):
 
     async def try_aquiare_slot(self, running_key, queue_key, request_id, max_parallel_requests, api_key):
         try:
+            if not self._try_acquire_script:
+                verbose_proxy_logger.debug(
+                    "RequestQueueLimiter: Lua scripts not registered, allowing request"
+                )
+                return None
+
             result = await self._try_acquire_script(
                 keys=[running_key, queue_key],
                 args=[
