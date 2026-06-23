@@ -10,6 +10,7 @@ from .max_iterations_limiter import _PROXY_MaxIterationsHandler
 from .parallel_request_limiter import _PROXY_MaxParallelRequestsHandler
 from .parallel_request_limiter_v3 import _PROXY_MaxParallelRequestsHandler_v3
 from .responses_id_security import ResponsesIDSecurity
+from .request_queue_limiter import _PROXY_RequestQueueLimiter
 
 ### CHECK IF ENTERPRISE HOOKS ARE AVAILABLE ####
 
@@ -21,12 +22,13 @@ except ImportError:
 # List of all available hooks that can be enabled
 PROXY_HOOKS = {
     "max_budget_limiter": _PROXY_MaxBudgetLimiter,
-    "parallel_request_limiter": _PROXY_MaxParallelRequestsHandler_v3,
+    #"parallel_request_limiter": _PROXY_MaxParallelRequestsHandler_v3,
     "cache_control_check": _PROXY_CacheControlCheck,
     "responses_id_security": ResponsesIDSecurity,
     "litellm_skills": SkillsInjectionHook,
     "max_iterations_limiter": _PROXY_MaxIterationsHandler,
     "max_budget_per_session_limiter": _PROXY_MaxBudgetPerSessionHandler,
+    "request_queue_limiter": _PROXY_RequestQueueLimiter,
 }
 
 ## FEATURE FLAG HOOKS ##
@@ -44,8 +46,9 @@ def get_proxy_hook(
         Literal[
             "max_budget_limiter",
             "managed_files",
-            "parallel_request_limiter",
+            #"parallel_request_limiter",
             "cache_control_check",
+            "request_queue_limiter",
         ],
         str,
     ],
